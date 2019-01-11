@@ -31,6 +31,9 @@ from ansible.cli import CLI
 from ansible import constants as C
 from ansible.errors import AnsibleOptionsError
 from ansible.module_utils._text import to_native, to_text
+from ansible.module_utils.six import iteritems, text_type
+from ansible.module_utils.six.moves import shlex_quote
+from ansible.parsing.splitter import parse_kv
 from ansible.plugins.loader import module_loader
 from ansible.utils.cmd_functions import run_cmd
 from ansible.utils.display import Display
@@ -104,21 +107,28 @@ class PullCLI(CLI):
                                help='run the playbook even if the repository could not be updated')
         self.parser.add_option('-d', '--directory', dest='dest', default=None, help='directory to checkout repository to')
         self.parser.add_option('-U', '--url', dest='url', default=None, help='URL of the playbook repository')
-        self.parser.add_option('--full', dest='fullclone', action='store_true', help='Do a full clone, instead of a shallow one.')
+        self.parser.add_option('--full', dest='fullclone', action='store_true',
+                               help='Do a full clone, instead of a shallow one. (deprecated in favor of using depth or export in --module-args)')
         self.parser.add_option('-C', '--checkout', dest='checkout',
-                               help='branch/tag/commit to checkout. Defaults to behavior of repository module.')
+                               help="".join(["branch/tag/commit to checkout. Defaults to behavior of repository module.",
+                                             "(deprecated, use --module-args 'version=<checkout>' or --module-args 'revision=<checkout>')"]))
         self.parser.add_option('--accept-host-key', default=False, dest='accept_host_key', action='store_true',
-                               help='adds the hostkey for the repo url if not already added')
+                               help="adds the hostkey for the repo url if not already added (deprecated, use --module-args 'accept_hostkey=yes')")
+        self.parser.add_option('-a', '--module-args', dest='module_args', default=None,
+                               help='Repository module arguments.')
         self.parser.add_option('-m', '--module-name', dest='module_name', default=self.DEFAULT_REPO_TYPE,
                                help='Repository module name, which ansible will use to check out the repo. Choices are %s. Default is %s.'
                                     % (self.REPO_CHOICES, self.DEFAULT_REPO_TYPE))
         self.parser.add_option('--verify-commit', dest='verify', default=False, action='store_true',
-                               help='verify GPG signature of checked out commit, if it fails abort running the playbook. '
-                                    'This needs the corresponding VCS module to support such an operation')
+                               help="".join(['verify GPG signature of checked out commit, if it fails abort running the playbook. ',
+                                             'This needs the corresponding VCS module to support such an operation.',
+                                             " (deprecated, use --module-args 'verify_commit=yes')"]))
         self.parser.add_option('--clean', dest='clean', default=False, action='store_true',
                                help='modified files in the working repository will be discarded')
         self.parser.add_option('--track-subs', dest='tracksubs', default=False, action='store_true',
-                               help='submodules will track the latest changes. This is equivalent to specifying the --remote flag to git submodule update')
+                               help="".join(["submodules will track the latest changes. This is equivalent to specifying",
+                                             " the --remote flag to git submodule update.",
+                                             " (deprecated, use --module-args 'track_submodules=yes')"]))
         # add a subset of the check_opts flag group manually, as the full set's
         # shortcodes conflict with above --checkout/-C
         self.parser.add_option("--check", default=False, dest='check', action='store_true',
@@ -147,8 +157,24 @@ class PullCLI(CLI):
         if not self.options.url:
             raise AnsibleOptionsError("URL for repository not specified, use -h for help")
 
+        if self.options.module_args:
+            self.scm_args = parse_kv(self.options.module_args)
+        else:
+            self.scm_args = {}
+
         if self.options.module_name not in self.SUPPORTED_REPO_MODULES:
             raise AnsibleOptionsError("Unsupported repo module %s, choices are %s" % (self.options.module_name, ','.join(self.SUPPORTED_REPO_MODULES)))
+
+        if 'dest' in self.scm_args:
+            raise AnsibleOptionsError("--module-args 'dest=<repo destination>' cannot be used, please use -d or --directory instead")
+
+        if self.options.module_name in ['bzr', 'git']:
+            if 'name' in self.scm_args and self.scm_args['name'] != self.options.url:
+                raise AnsibleOptionsError("--module-args 'name=<repo URL>' cannot be used, please use -U or --url instead")
+
+        if self.options.module_name in ['hg', 'subversion']:
+            if 'repo' in self.scm_args and self.scm_args['repo'] != self.options.url:
+                raise AnsibleOptionsError("--module-args 'repo=<repo URL>' cannot be used, please use -U or --url instead")
 
         display.verbosity = self.options.verbosity
         self.validate_conflicts(vault_opts=True)
@@ -178,46 +204,77 @@ class PullCLI(CLI):
         if not inv_opts:
             inv_opts = " -i localhost, "
 
-        # SCM specific options
-        if self.options.module_name == 'git':
-            repo_opts = "name=%s dest=%s" % (self.options.url, self.options.dest)
-            if self.options.checkout:
-                repo_opts += ' version=%s' % self.options.checkout
-
-            if self.options.accept_host_key:
-                repo_opts += ' accept_hostkey=yes'
-
-            if self.options.private_key_file:
-                repo_opts += ' key_file=%s' % self.options.private_key_file
-
-            if self.options.verify:
-                repo_opts += ' verify_commit=yes'
-
-            if self.options.tracksubs:
-                repo_opts += ' track_submodules=yes'
-
-            if not self.options.fullclone:
-                repo_opts += ' depth=1'
-        elif self.options.module_name == 'subversion':
-            repo_opts = "repo=%s dest=%s" % (self.options.url, self.options.dest)
-            if self.options.checkout:
-                repo_opts += ' revision=%s' % self.options.checkout
-            if not self.options.fullclone:
-                repo_opts += ' export=yes'
-        elif self.options.module_name == 'hg':
-            repo_opts = "repo=%s dest=%s" % (self.options.url, self.options.dest)
-            if self.options.checkout:
-                repo_opts += ' revision=%s' % self.options.checkout
-        elif self.options.module_name == 'bzr':
-            repo_opts = "name=%s dest=%s" % (self.options.url, self.options.dest)
-            if self.options.checkout:
-                repo_opts += ' version=%s' % self.options.checkout
-        else:
+        if self.options.module_name not in self.REPO_CHOICES:
             raise AnsibleOptionsError('Unsupported (%s) SCM module for pull, choices are: %s' % (self.options.module_name, ','.join(self.REPO_CHOICES)))
 
-        # options common to all supported SCMS
+        # SCM options
+        self.scm_args['dest'] = self.options.dest
+
+        if self.options.module_name in ['bzr', 'git']:
+            self.scm_args['name'] = self.options.url
+
+        if self.options.module_name in ['hg', 'subversion']:
+            self.scm_args['repo'] = self.options.url
+
+        if self.options.checkout and self.options.module_name in ['bzr', 'git', 'hg', 'subversion']:
+            if self.options.module_name in ['bzr', 'git']:
+                checkout_key = 'version'
+            elif self.options.module_name in ['hg', 'subversion']:
+                checkout_key = 'revision'
+
+            if checkout_key in self.scm_args:
+                display.warning("--module-args '%s' argument was provided but is being overridden by deprecated -C or --checkout for backward compatibility" % checkout_key)
+
+            self.scm_args[checkout_key] = self.options.checkout
+
         if self.options.clean:
-            repo_opts += ' force=yes'
+            self.scm_args['force'] = 'yes'
+
+        if self.options.module_name == 'git':
+            if self.options.accept_host_key:
+                if 'accept_hostkey' in self.scm_args:
+                    display.warning("--module-args 'accept_hostkey' argument was provided but is being overridden by deprecated --accept-host-key for backward compatibility")
+
+                self.scm_args['accept_hostkey'] = 'yes'
+
+            if not self.options.fullclone and 'depth' not in self.scm_args:
+                self.scm_args['depth'] = '1'
+
+            elif self.options.fullclone and 'depth' in self.scm_args:
+                display.warning("--module-args 'depth' argument was provided but is being removed by --full for backward compatibility")
+
+                del self.scm_args['depth']
+
+            if self.options.private_key_file:
+                if 'key_file' in self.scm_args:
+                    display.warning("--module-args 'key_file' argument was provided but is being overridden by --key-file or --private-key for backward compatibility")
+
+                self.scm_args['key_file'] = self.options.private_key_file
+
+            if self.options.tracksubs:
+                if 'track_submodules' in self.scm_args:
+                    display.warning("--module-args 'track_submodules' argument was provided but is being overridden by deprecated --track-subs for backward compatibility")
+
+                self.scm_args['track_submodules'] = 'yes'
+
+            if self.options.verify:
+                if 'verify_commit' in self.scm_args:
+                    display.warning("--module-args 'verify_commit' argument was provided but is being overridden by deprecated --verify-commit for backward compatibility")
+
+                self.scm_args['verify_commit'] = 'yes'
+        elif self.options.module_name == 'subversion':
+            if not self.options.fullclone and 'export' not in self.scm_args:
+                self.scm_args['export'] = 'yes'
+
+            elif self.options.fullclone and 'export' in self.scm_args:
+                display.warning("--module-args 'export' argument was provided but is being removed by --full for backward compatibility")
+
+                del self.scm_args['export']
+
+        scm_args_str = ""
+
+        for k, v in iteritems(self.scm_args):
+            scm_args_str+= '%s=%s ' % (k, shlex_quote(text_type(v)))
 
         path = module_loader.find_plugin(self.options.module_name)
         if path is None:
@@ -225,7 +282,7 @@ class PullCLI(CLI):
 
         bin_path = os.path.dirname(os.path.abspath(sys.argv[0]))
         # hardcode local and inventory/host as this is just meant to fetch the repo
-        cmd = '%s/ansible %s %s -m %s -a "%s" all -l "%s"' % (bin_path, inv_opts, base_opts, self.options.module_name, repo_opts, limit_opts)
+        cmd = '%s/ansible %s %s -m %s -a %s all -l "%s"' % (bin_path, inv_opts, base_opts, self.options.module_name, shlex_quote(text_type(scm_args_str)), limit_opts)
 
         for ev in self.options.extra_vars:
             cmd += ' -e "%s"' % ev
